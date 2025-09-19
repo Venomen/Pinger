@@ -29,7 +29,8 @@ A minimal macOS menu bar application that monitors network connectivity by sendi
 
 ## Installation
 
-- Download & run Release.
+1. Download & run Release.
+2. On first launch, macOS will warn because the app is from an unidentified developer. Use right-click → Open to run it.
 
 OR 
 
