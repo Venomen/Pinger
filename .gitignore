@@ -60,3 +60,20 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Xcode
+DerivedData/
+build/
+*.xcuserdatad
+*.xcuserdata
+*.xcworkspace/xcuserdata
+*.moved-aside
+*.xcarchive
+
+# macOS
+.DS_Store
+
+# Bundles
+*.app
+*.dmg
+*.zip
