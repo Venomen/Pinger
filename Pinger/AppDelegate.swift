@@ -10,22 +10,23 @@ import UserNotifications
 
 // MARK: - Config & keys
 fileprivate enum Config {
-    static var intervalSeconds: TimeInterval = 1.0      // adjustable in Settings
-    static var upThreshold = 2                           // 1/2/3 – anti-flap
+    static var intervalSeconds: TimeInterval = 1.0
+    static var upThreshold = 2
     static var downThreshold = 2
-    static let pingPath = "/sbin/ping"                   // requires App Sandbox OFF
+    static let pingPath = "/sbin/ping"                   // App Sandbox OFF required
     static let defaultHosts = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
     static let appAuthor = "deregowski.net © 2025"
 }
 
 fileprivate enum PrefKey {
     static let hosts = "hosts"
-    static let activeHost = "activeHost"
+    static let activeHost = "activeHost"     // legacy
+    static let monitored = "monitoredHosts"  // multi-select
     static let notify = "notify"
     static let interval = "interval"
-    static let flap = "flap"          // 1/2/3
+    static let flap = "flap"
     static let logsEnabled = "logsEnabled"
-    static let showDockIcon = "showDockIcon" // <- new
+    static let showDockIcon = "showDockIcon"
 }
 
 // Simple logger toggled by UserDefaults
@@ -38,37 +39,50 @@ private func L(_ msg: @autoclosure () -> String) {
 // JSON model for persisted config
 struct PingerConfig: Codable {
     var hosts: [String]
+    var monitored: [String]?
     var activeHost: String?
     var interval: Double
     var flap: Int
     var notify: Bool
     var logs: Bool
-    var showDock: Bool // <- new
+    var showDock: Bool
+}
+
+// Per-host anti-flap state
+private struct HostState {
+    var consecutiveUp = 0
+    var consecutiveDown = 0
+    var lastStableIsUp: Bool? = nil
+    var inFlight = false
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuDelegate {
 
     // UI
     private var statusItem: NSStatusItem!
-    private var statusMenuItem: NSMenuItem?      // “Status: …”
-    private var startStopMenuItem: NSMenuItem?   // Start/Stop toggle
-    private var pingIntervalMenu: NSMenu?        // interval radio list
-    private var flapMenu: NSMenu?                // anti-flap radio list
-    private var dockIconMenuItem: NSMenuItem?    // Show Dock icon toggle
+    private var statusMenuItem: NSMenuItem?
+    private var startStopMenuItem: NSMenuItem?
+    private var pingIntervalMenu: NSMenu?
+    private var flapMenu: NSMenu?
+    private var dockIconMenuItem: NSMenuItem?
 
     // Timer
     private var timer: DispatchSourceTimer?
-    private var isRunning = false                // default: PAUSED
+    private var isRunning = false
 
     // Model
     private var hosts: [String] = []
-    private var activeHost: String?
-    private var lastStableIsUp: Bool?            // after anti-flap
-    private var consecutiveUp = 0
-    private var consecutiveDown = 0
+    private var activeHost: String?              // legacy (for migration)
 
-    // Reentrancy & anti-flicker
-    private let checkGate = DispatchSemaphore(value: 1)
+    // 🔒 Shared state protected by a serial queue
+    private let stateQ = DispatchQueue(label: "net.deregowski.Pinger.state")
+    private var monitoredHosts = Set<String>()           // protected by stateQ
+    private var hostStates: [String: HostState] = [:]    // protected by stateQ
+
+    // Menu item map (UI only)
+    private var hostMenuItems: [String: NSMenuItem] = [:]
+
+    // Reentrancy & anti-flicker (UI)
     private var menuOpen = false
     private var lastStatusText = ""
 
@@ -84,66 +98,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     // MARK: - App lifecycle
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Apply Dock visibility policy ASAP (before UI)
         applyActivationPolicyFromPrefs()
 
-        // Menu bar
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(paletteColors: [.systemGray]))
-        statusItem.button?.image?.isTemplate = false
-        statusItem.button?.toolTip = "Ping Monitor"
+        setTrayIcon(color: .systemGray, tooltip: "Paused")
 
         let menu = buildMenu()
         menu.delegate = self
         statusItem.menu = menu
 
-        // Notifications
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
-        // Load prefs and (if present) config file
         loadPrefs()
-        _ = loadConfigFromDiskIfPresent() // merge if config.json exists
+        _ = loadConfigFromDiskIfPresent()
 
-        // Reflect Dock icon setting in menu
         dockIconMenuItem?.state = isDockIconShown ? .on : .off
 
-        // Start paused UI
         isRunning = false
         updateStartStopTitle()
         setStatusText("Paused")
-        updateIcon(isUp: nil) // gray only when paused
+        updateAggregateTrayIcon()
 
-        L("start with hosts=\(hosts), active=\(activeHost ?? "nil")")
+        L("start with hosts=\(hosts), monitored=\(stateQ.sync { Array(monitoredHosts) })")
 
-        // First-launch auto-save (creates config.json if missing)
         autoSaveConfigToDisk()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         stopTimer()
-        // Auto-save current settings on quit
         autoSaveConfigToDisk()
     }
 
     // MARK: - Dock icon (activation policy)
     private func applyActivationPolicyFromPrefs() {
-        let desired: NSApplication.ActivationPolicy = isDockIconShown ? .regular : .accessory
-        NSApp.setActivationPolicy(desired)
+        NSApp.setActivationPolicy(isDockIconShown ? .regular : .accessory)
     }
 
     private func relaunchApp() {
         guard let bundlePath = Bundle.main.bundlePath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
-            NSApp.terminate(nil)
-            return
+            NSApp.terminate(nil); return
         }
-        // Launch new instance
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = [bundlePath]
         try? task.run()
-        // Terminate current instance
         NSApp.terminate(nil)
     }
 
@@ -157,7 +156,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         t.resume()
         timer = t
         updateStartStopTitle()
-        // immediate first check
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.tick() }
     }
 
@@ -166,11 +164,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         timer = nil
         isRunning = false
         updateStartStopTitle()
-        // clear state and UI
-        lastStableIsUp = nil
-        consecutiveUp = 0; consecutiveDown = 0
+
+        stateQ.async { [weak self] in
+            guard let self else { return }
+            for k in self.hostStates.keys { self.hostStates[k] = HostState() }
+        }
+
         setStatusText("Paused")
-        updateIcon(isUp: nil) // gray = paused
+        setTrayIcon(color: .systemGray, tooltip: "Paused")
+        refreshTargetsSection()
     }
 
     private func restartTimerKeepingState() {
@@ -183,14 +185,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         menu.autoenablesItems = false
         menu.delegate = self
 
-        // 0) Status
         let status = NSMenuItem(title: "Status: Paused", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         statusMenuItem = status
         menu.addItem(.separator())
 
-        // 1) Start/Stop
         let startStop = NSMenuItem(title: "Start", action: #selector(toggleStartStop), keyEquivalent: "s")
         startStop.target = self
         menu.addItem(startStop)
@@ -198,29 +198,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         menu.addItem(.separator())
 
-        // 2) Targets header + dynamic list
         let header = NSMenuItem(title: "Targets", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
         refreshTargetsSection(in: menu)
 
-        // Add/Remove host
         let addItem = NSMenuItem(title: "Add Host…", action: #selector(addHost), keyEquivalent: "a")
         addItem.target = self
         menu.addItem(addItem)
 
-        let removeItem = NSMenuItem(title: "Remove Active Host", action: #selector(removeActiveHost), keyEquivalent: "")
+        let removeItem = NSMenuItem(title: "Remove Selected", action: #selector(removeSelectedHosts), keyEquivalent: "")
         removeItem.target = self
         menu.addItem(removeItem)
 
+        // NEW: Select/Deselect all
+        let selectAll = NSMenuItem(title: "Select All Targets", action: #selector(selectAllTargets), keyEquivalent: "")
+        selectAll.target = self
+        menu.addItem(selectAll)
+
+        let deselectAll = NSMenuItem(title: "Deselect All Targets", action: #selector(deselectAllTargets), keyEquivalent: "")
+        deselectAll.target = self
+        menu.addItem(deselectAll)
+
         menu.addItem(.separator())
 
-        // 3) Settings
         let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         let settingsSub = NSMenu()
 
-        // Ping interval
         let intervalItem = NSMenuItem(title: "Ping interval", action: nil, keyEquivalent: "")
         let intervalSub = NSMenu()
         for (title, value) in [("0.5 s", 0.5), ("1 s", 1.0), ("2 s", 2.0), ("5 s", 5.0)] {
@@ -234,7 +239,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         pingIntervalMenu = intervalSub
         settingsSub.addItem(intervalItem)
 
-        // Anti-flap
         let flapItem = NSMenuItem(title: "Stabilization (anti-flap)", action: nil, keyEquivalent: "")
         let flapSub = NSMenu()
         for val in [1,2,3] {
@@ -248,19 +252,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         flapMenu = flapSub
         settingsSub.addItem(flapItem)
 
-        // Notifications
         let notifyItem = NSMenuItem(title: "Notifications", action: #selector(toggleNotifications(_:)), keyEquivalent: "")
         notifyItem.target = self
         notifyItem.state = isNotificationsEnabled ? .on : .off
         settingsSub.addItem(notifyItem)
 
-        // Console logs
         let logsItem = NSMenuItem(title: "Console logs", action: #selector(toggleLogs(_:)), keyEquivalent: "")
         logsItem.target = self
         logsItem.state = (UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true) ? .on : .off
         settingsSub.addItem(logsItem)
 
-        // Show Dock icon (runtime policy + relaunch)
         let dockItem = NSMenuItem(title: "Show Dock icon", action: #selector(toggleDockIcon(_:)), keyEquivalent: "")
         dockItem.target = self
         dockItem.state = isDockIconShown ? .on : .off
@@ -270,13 +271,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         settings.submenu = settingsSub
         menu.addItem(settings)
 
-        // 4) About
         let aboutItem = NSMenuItem(title: "About Pinger", action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(.separator())
         menu.addItem(aboutItem)
 
-        // 5) Quit
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -290,62 +289,107 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    // Inject dynamic target list
+    // Build/refresh checkable target list with per-host dot
     private func refreshTargetsSection(in menu: NSMenu? = nil) {
         let m = menu ?? statusItem.menu!
 
-        // Find "Targets" section boundaries
         var startIdx: Int?
         var endIdx: Int?
         for (i, item) in m.items.enumerated() {
             if item.title == "Targets" && !item.isEnabled { startIdx = i + 1 }
             else if startIdx != nil && item.isSeparatorItem { endIdx = i; break }
         }
-        // Clear previous items
         if let s = startIdx, let e = endIdx, e > s {
+            hostMenuItems.removeAll()
             for _ in s..<e { m.removeItem(at: s) }
         }
-        // Ensure defaults on first run
-        if hosts.isEmpty {
-            hosts = Config.defaultHosts
-            if activeHost == nil { activeHost = hosts.first }
-            savePrefs()
+
+        // ❌ No auto-refill defaults here
+        // Just ensure HostState exists for known hosts
+        stateQ.sync {
+            for h in self.hosts where self.hostStates[h] == nil {
+                self.hostStates[h] = HostState()
+            }
         }
-        // Insert radio list
+
         var insertAt = startIdx ?? 1
-        let active = activeHost
+        let monSnap = stateQ.sync { self.monitoredHosts }
         for host in hosts {
-            let item = NSMenuItem(title: host, action: #selector(selectHost(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: host, action: #selector(toggleMonitorHost(_:)), keyEquivalent: "")
             item.target = self
-            item.state = (host == active) ? .on : .off
+            item.state = monSnap.contains(host) ? .on : .off
+            item.image = miniDot(for: host)
+            item.image?.size = NSSize(width: 10, height: 10)
             m.insertItem(item, at: insertAt)
+            hostMenuItems[host] = item
             insertAt += 1
         }
     }
 
-    // MARK: - Menu delegate (reduce status flicker when open)
+    // MARK: - Menu delegate
     func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     // MARK: - Actions
     @objc private func toggleStartStop() {
-        if isRunning { stopTimer() } else { startTimer() }
+        if isRunning {
+            stopTimer()
+            return
+        }
+        // START requested
+        if hosts.isEmpty {
+            showInfoAlert(title: "No hosts added",
+                          text: "Add a host via “Add Host…” before starting.")
+            return
+        }
+        let anySelected = stateQ.sync { !self.monitoredHosts.isEmpty }
+        if !anySelected {
+            showInfoAlert(title: "No targets selected",
+                          text: "Select at least one target in the “Targets” section.")
+            return
+        }
+        startTimer()
     }
 
-    @objc private func selectHost(_ sender: NSMenuItem) {
-        activeHost = sender.title
-        savePrefs()
-        consecutiveUp = 0
-        consecutiveDown = 0
-        lastStableIsUp = nil
-        refreshTargetsSection()
-        if isRunning {
-            DispatchQueue.global(qos: .utility).async { [weak self] in self?.tick() }
-        } else {
-            setStatusText("Paused")
-            updateIcon(isUp: nil)
+    @objc private func toggleMonitorHost(_ sender: NSMenuItem) {
+        let host = sender.title
+        stateQ.sync {
+            if self.monitoredHosts.contains(host) {
+                self.monitoredHosts.remove(host)
+            } else {
+                self.monitoredHosts.insert(host)
+                self.hostStates[host] = HostState()
+            }
         }
+        sender.state = stateQ.sync { self.monitoredHosts.contains(host) ? .on : .off }
+        updateMenuIcon(for: host)
+        savePrefs()
         autoSaveConfigToDisk()
+        updateAggregateTrayIcon()
+
+        let isMonitored = stateQ.sync { self.monitoredHosts.contains(host) }
+        if isRunning && isMonitored {
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.pingOne(host: host) }
+        }
+    }
+
+    @objc private func selectAllTargets() {
+        stateQ.sync {
+            self.monitoredHosts = Set(self.hosts)
+            for h in self.hosts where self.hostStates[h] == nil { self.hostStates[h] = HostState() }
+        }
+        refreshTargetsSection()
+        savePrefs()
+        autoSaveConfigToDisk()
+        updateAggregateTrayIcon()
+    }
+
+    @objc private func deselectAllTargets() {
+        stateQ.sync { self.monitoredHosts.removeAll() }
+        refreshTargetsSection()
+        savePrefs()
+        autoSaveConfigToDisk()
+        updateAggregateTrayIcon()
     }
 
     @objc private func addHost() {
@@ -361,29 +405,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let newHost = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !newHost.isEmpty else { return }
             if !hosts.contains(newHost) {
-                hosts.insert(newHost, at: 0) // add to top
-                activeHost = newHost         // and make active
+                hosts.insert(newHost, at: 0)
+                stateQ.sync {
+                    self.monitoredHosts.insert(newHost)
+                    self.hostStates[newHost] = HostState()
+                }
                 savePrefs()
                 refreshTargetsSection()
-                if isRunning {
-                    DispatchQueue.global(qos: .utility).async { [weak self] in self?.tick() }
-                } else {
-                    setStatusText("Paused")
-                    updateIcon(isUp: nil)
-                }
                 autoSaveConfigToDisk()
+                if isRunning {
+                    DispatchQueue.global(qos: .utility).async { [weak self] in self?.pingOne(host: newHost) }
+                }
             }
         }
     }
 
-    @objc private func removeActiveHost() {
-        guard let active = activeHost, let idx = hosts.firstIndex(of: active) else { return }
-        hosts.remove(at: idx)
-        activeHost = hosts.first
+    @objc private func removeSelectedHosts() {
+        let selected = stateQ.sync { self.monitoredHosts }
+        if selected.isEmpty {
+            NSSound.beep()
+            return
+        }
+        let toRemove = hosts.filter { selected.contains($0) }
+        guard !toRemove.isEmpty else { return }
+
+        stateQ.sync {
+            for h in toRemove {
+                self.monitoredHosts.remove(h)
+                self.hostStates.removeValue(forKey: h)
+                self.hosts.removeAll { $0 == h }
+            }
+        }
         savePrefs()
         refreshTargetsSection()
-        if !isRunning { updateIcon(isUp: nil) }
         autoSaveConfigToDisk()
+        updateAggregateTrayIcon()
     }
 
     @objc private func setInterval(_ sender: NSMenuItem) {
@@ -402,8 +458,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         Config.downThreshold = val
         flapMenu?.items.forEach { $0.state = .off }
         sender.state = .on
-        UserDefaults.standard.set(val, forKey: PrefKey.flap)
-        consecutiveUp = 0; consecutiveDown = 0; lastStableIsUp = nil
+        stateQ.sync {
+            for k in self.hostStates.keys { self.hostStates[k] = HostState() }
+        }
         autoSaveConfigToDisk()
     }
 
@@ -425,7 +482,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         isDockIconShown.toggle()
         sender.state = isDockIconShown ? .on : .off
         autoSaveConfigToDisk()
-        // Apply policy + relaunch for a clean switch
         applyActivationPolicyFromPrefs()
         relaunchApp()
     }
@@ -436,7 +492,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let path = (try? configFileURL().path) ?? "(unavailable)"
         let desc =
         """
-        A tiny menu bar monitor that pings a chosen host on an interval.
+        A tiny menu bar monitor that pings selected hosts in parallel.
         Uses /sbin/ping (ICMP). Requires App Sandbox OFF and /sbin/ping at that path.
         Anti-flap stabilization and notifications built-in. Config file is JSON, autosaved.
         """
@@ -456,28 +512,77 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     @objc private func quit() { NSApp.terminate(nil) }
 
-    // MARK: - Tick / Ping / Anti-flap
+    // MARK: - Tick / Parallel pings
     private func tick() {
         if !isRunning { return }
-        if checkGate.wait(timeout: .now()) != .success { return }
-        defer { checkGate.signal() }
 
-        guard let host = activeHost, !host.isEmpty else {
-            setStatusText("Waiting…")
+        let targets: [String] = stateQ.sync { Array(self.monitoredHosts) }
+        guard !targets.isEmpty else {
+            setStatusText("No targets selected")
+            setTrayIcon(color: .systemGray, tooltip: "No targets")
             return
         }
 
-        if !menuOpen { setStatusText("Checking… (\(host))") }
-        // keep last icon while checking
+        if !menuOpen {
+            setStatusText("Checking… (\(targets.count) host\(targets.count > 1 ? "s" : ""))")
+        }
 
-        let up = runPingOnceICMP(host: host)  // real ICMP (Sandbox OFF)
+        for host in targets {
+            pingOne(host: host)
+        }
+    }
 
-        // Immediately reflect raw result on the icon (green/red),
-        // gray is reserved strictly for "paused".
-        updateIcon(isUp: up ? true : false)
+    private func pingOne(host: String) {
+        // atomically mark inFlight
+        let shouldStart: Bool = stateQ.sync {
+            var st = self.hostStates[host] ?? HostState()
+            if st.inFlight { return false }
+            st.inFlight = true
+            self.hostStates[host] = st
+            return true
+        }
+        if !shouldStart { return }
 
-        L("PING \(host) -> \(up ? "UP" : "DOWN")")
-        applyAntiFlap(with: up, host: host)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let up = self.runPingOnceICMP(host: host)
+
+            var changedTo: Bool? = nil
+            self.stateQ.sync {
+                var st = self.hostStates[host] ?? HostState()
+                if up { st.consecutiveUp += 1; st.consecutiveDown = 0 }
+                else  { st.consecutiveDown += 1; st.consecutiveUp = 0 }
+
+                var newStable: Bool?
+                if up,   st.consecutiveUp   >= Config.upThreshold   { newStable = true  }
+                if !up,  st.consecutiveDown >= Config.downThreshold { newStable = false }
+
+                if let ns = newStable {
+                    if st.lastStableIsUp == nil || st.lastStableIsUp! != ns {
+                        changedTo = ns
+                    }
+                    st.lastStableIsUp = ns
+                }
+                st.inFlight = false
+                self.hostStates[host] = st
+            }
+
+            if let ns = changedTo, self.isNotificationsEnabled {
+                self.notifyChange(isUp: ns, host: host)
+            }
+            self.updateMenuIcon(for: host)
+            self.updateAggregateTrayIcon()
+
+            if !self.menuOpen {
+                let counts = self.stateQ.sync {
+                    (
+                        up: self.monitoredHosts.compactMap { self.hostStates[$0]?.lastStableIsUp }.filter { $0 }.count,
+                        total: self.monitoredHosts.count
+                    )
+                }
+                self.setStatusText("\(counts.up)/\(counts.total) up")
+            }
+        }
     }
 
     // ICMP via /sbin/ping (requires App Sandbox OFF)
@@ -494,81 +599,76 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             L("exec: \(Config.pingPath) \(task.arguments!.joined(separator: " "))")
             try task.run()
             task.waitUntilExit()
-
-            let status = Int(task.terminationStatus)
-            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-            let output = String(data: data, encoding: .utf8) ?? ""
-
-            if status == 0 {
-                if let line = output.split(separator: "\n").first(where: { $0.contains("round-trip") || $0.contains("rtt") }) {
-                    setStatusText("UP \(host) • \(line)")
-                } else {
-                    setStatusText("UP \(host)")
-                }
-                L("ping OK \(host) \(output)")
-                return true
-            } else {
-                if output.contains("Operation not permitted") {
-                    setStatusText("ERROR: ICMP blocked (sandbox)")
-                } else {
-                    setStatusText("DOWN \(host)")
-                }
-                L("ping FAIL \(host) exit=\(status) output=\(output)")
-                return false
-            }
+            return Int(task.terminationStatus) == 0
         } catch {
-            setStatusText("ERROR \(host)")
             L("ping exec failed: \(error)")
             return false
         }
     }
 
-    private func applyAntiFlap(with isUp: Bool, host: String) {
-        if isUp { consecutiveUp += 1; consecutiveDown = 0 }
-        else    { consecutiveDown += 1; consecutiveUp = 0 }
-
-        // Determine stable state
-        var newStable: Bool?
-        if isUp,   consecutiveUp   >= Config.upThreshold   { newStable = true  }
-        if !isUp,  consecutiveDown >= Config.downThreshold { newStable = false }
-
-        if let newStable = newStable {
-            // Notify only on real change of the *stable* state
-            if lastStableIsUp == nil || lastStableIsUp! != newStable {
-                if isNotificationsEnabled { notifyChange(isUp: newStable, host: host) }
-            }
-            lastStableIsUp = newStable
-            // Ensure icon matches stable state (green/red)
-            updateIcon(isUp: newStable)
-            setStatusText("\(newStable ? "UP" : "DOWN") \(host)")
-        }
-    }
-
     // MARK: - UI helpers
     private func setStatusText(_ text: String) {
-        if menuOpen { return }                    // don't flicker while menu is open
-        if text == lastStatusText { return }      // anti-flicker
+        if menuOpen { return }
+        if text == lastStatusText { return }
         lastStatusText = text
         DispatchQueue.main.async {
             self.statusMenuItem?.title = "Status: " + text
         }
     }
 
-    private func updateIcon(isUp: Bool?) {
+    private func setTrayIcon(color: NSColor, tooltip: String) {
         DispatchQueue.main.async {
             let base = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
-            switch isUp {
-            case .some(true):
-                self.statusItem.button?.image = base?.withSymbolConfiguration(.init(paletteColors: [.systemGreen]))
-                self.statusItem.button?.toolTip = "Reachable"
-            case .some(false):
-                self.statusItem.button?.image = base?.withSymbolConfiguration(.init(paletteColors: [.systemRed]))
-                self.statusItem.button?.toolTip = "No response"
-            case .none:
-                self.statusItem.button?.image = base?.withSymbolConfiguration(.init(paletteColors: [.systemGray]))
-                self.statusItem.button?.toolTip = "Paused"
-            }
+            self.statusItem.button?.image = base?.withSymbolConfiguration(.init(paletteColors: [color]))
             self.statusItem.button?.image?.isTemplate = false
+            self.statusItem.button?.toolTip = tooltip
+        }
+    }
+
+    private func updateAggregateTrayIcon() {
+        if !isRunning {
+            setTrayIcon(color: .systemGray, tooltip: "Paused")
+            return
+        }
+        let isEmpty = stateQ.sync { self.monitoredHosts.isEmpty }
+        if isEmpty {
+            setTrayIcon(color: .systemGray, tooltip: "No targets")
+            return
+        }
+
+        let tuple: (Bool, Bool) = stateQ.sync {
+            var down = false
+            var unknown = false
+            for h in self.monitoredHosts {
+                guard let st = self.hostStates[h]?.lastStableIsUp else { unknown = true; continue }
+                if st == false { down = true }
+            }
+            return (down, unknown)
+        }
+        let anyDown = tuple.0
+        let anyUnknown = tuple.1
+
+        if anyDown {
+            setTrayIcon(color: .systemRed, tooltip: "Some hosts down")
+        } else if !anyUnknown {
+            setTrayIcon(color: .systemGreen, tooltip: "All hosts up")
+        }
+        // otherwise keep previous color while stabilizing
+    }
+
+    private func miniDot(for host: String) -> NSImage? {
+        let stable = stateQ.sync { self.hostStates[host]?.lastStableIsUp }
+        let color: NSColor = (stable == nil) ? .systemGray : (stable! ? .systemGreen : .systemRed)
+        return NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: [color]))
+    }
+
+    private func updateMenuIcon(for host: String) {
+        DispatchQueue.main.async {
+            if let item = self.hostMenuItems[host] {
+                item.image = self.miniDot(for: host)
+                item.image?.size = NSSize(width: 10, height: 10)
+            }
         }
     }
 
@@ -585,15 +685,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private func loadPrefs() {
         let ud = UserDefaults.standard
 
-        // Hosts
-        if let saved = ud.array(forKey: PrefKey.hosts) as? [String], !saved.isEmpty {
-            hosts = saved
+        // First run: if key missing -> defaults; if key exists (even empty array) -> use it.
+        if ud.object(forKey: PrefKey.hosts) != nil {
+            hosts = (ud.array(forKey: PrefKey.hosts) as? [String]) ?? []
         } else {
             hosts = Config.defaultHosts
             ud.set(hosts, forKey: PrefKey.hosts)
         }
 
-        // Active
         if let act = ud.string(forKey: PrefKey.activeHost), hosts.contains(act) {
             activeHost = act
         } else {
@@ -601,32 +700,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             ud.set(activeHost, forKey: PrefKey.activeHost)
         }
 
-        // Notifications
-        if ud.object(forKey: PrefKey.notify) == nil { ud.set(true, forKey: PrefKey.notify) }
-
-        // Interval
-        if let iv = ud.object(forKey: PrefKey.interval) as? Double { Config.intervalSeconds = iv }
-
-        // Anti-flap
-        if let flap = ud.object(forKey: PrefKey.flap) as? Int {
-            Config.upThreshold = flap; Config.downThreshold = flap
+        stateQ.sync {
+            if let arr = ud.array(forKey: PrefKey.monitored) as? [String] {
+                self.monitoredHosts = Set(arr.filter { hosts.contains($0) })
+            } else {
+                // first run: default = active if exists else all (could be empty)
+                if let a = activeHost, hosts.contains(a) { self.monitoredHosts = [a] }
+                else { self.monitoredHosts = Set(hosts) }
+                ud.set(Array(self.monitoredHosts), forKey: PrefKey.monitored)
+            }
+            for h in hosts where self.hostStates[h] == nil { self.hostStates[h] = HostState() }
         }
 
-        // Logs
+        if ud.object(forKey: PrefKey.notify) == nil { ud.set(true, forKey: PrefKey.notify) }
+        if let iv = ud.object(forKey: PrefKey.interval) as? Double { Config.intervalSeconds = iv }
+        if let flap = ud.object(forKey: PrefKey.flap) as? Int { Config.upThreshold = flap; Config.downThreshold = flap }
         if ud.object(forKey: PrefKey.logsEnabled) == nil { ud.set(true, forKey: PrefKey.logsEnabled) }
-
-        // Dock icon (default true)
         if ud.object(forKey: PrefKey.showDockIcon) == nil { ud.set(true, forKey: PrefKey.showDockIcon) }
 
-        // UI
         setStatusText("Paused")
-        updateIcon(isUp: nil)
+        updateAggregateTrayIcon()
     }
 
     private func savePrefs() {
         let ud = UserDefaults.standard
-        ud.set(hosts, forKey: PrefKey.hosts)
-        ud.set(activeHost, forKey: PrefKey.activeHost)
+        ud.set(hosts, forKey: PrefKey.hosts)                      // may be empty
+        let mon = stateQ.sync { Array(self.monitoredHosts) }
+        ud.set(mon, forKey: PrefKey.monitored)                    // may be empty
+        if let a = activeHost { ud.set(a, forKey: PrefKey.activeHost) }
     }
 
     private func configFileURL() throws -> URL {
@@ -637,11 +738,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         return dir.appendingPathComponent("config.json")
     }
 
-    /// Writes the current settings to Application Support/Pinger/config.json
     private func autoSaveConfigToDisk() {
         do {
             let cfg = PingerConfig(
                 hosts: hosts,
+                monitored: stateQ.sync { Array(self.monitoredHosts) },
                 activeHost: activeHost,
                 interval: Config.intervalSeconds,
                 flap: Config.upThreshold,
@@ -651,14 +752,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             )
             let data = try JSONEncoder().encode(cfg)
             let url = try configFileURL()
-            try data.write(to: url, options: Data.WritingOptions.atomic)
+            try data.write(to: url, options: .atomic)
             L("config auto-saved to \(url.path)")
-        } catch {
-            L("config auto-save failed: \(error)")
-        }
+        } catch { L("config auto-save failed: \(error)") }
     }
 
-    /// Loads config.json if present (merges into current state). Returns true if loaded.
     @discardableResult
     private func loadConfigFromDiskIfPresent() -> Bool {
         do {
@@ -668,7 +766,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let cfg = try JSONDecoder().decode(PingerConfig.self, from: data)
 
             self.hosts = cfg.hosts
-            self.activeHost = cfg.activeHost ?? cfg.hosts.first
+            stateQ.sync {
+                if let mon = cfg.monitored {
+                    self.monitoredHosts = Set(mon.filter { cfg.hosts.contains($0) })
+                } else if let a = cfg.activeHost, cfg.hosts.contains(a) {
+                    self.monitoredHosts = [a]
+                } else {
+                    self.monitoredHosts = Set(cfg.hosts)
+                }
+                self.hostStates.removeAll()
+                for h in self.hosts { self.hostStates[h] = HostState() }
+            }
+
+            self.activeHost = cfg.activeHost
             Config.intervalSeconds = cfg.interval
             Config.upThreshold = cfg.flap
             Config.downThreshold = cfg.flap
@@ -676,7 +786,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             UserDefaults.standard.set(cfg.logs, forKey: PrefKey.logsEnabled)
             UserDefaults.standard.set(cfg.showDock, forKey: PrefKey.showDockIcon)
 
-            // Apply policy (in case user toggled this in a previous session)
             applyActivationPolicyFromPrefs()
 
             savePrefs()
@@ -694,5 +803,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .sound]
+    }
+
+    // MARK: - Small helpers
+    private func showInfoAlert(title: String, text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.alertStyle = .informational
+        a.addButton(withTitle: "OK")
+        a.runModal()
     }
 }
