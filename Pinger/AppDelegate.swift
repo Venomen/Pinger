@@ -31,9 +31,10 @@ fileprivate enum PrefKey {
 
 // Simple logger controlled by UserDefaults flag
 private struct AppLogger {
-private func L(_ msg: @autoclosure () -> String) {
-    if UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true {
-        print(msg())
+    static func L(_ msg: @autoclosure () -> String) {
+        if UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true {
+            print(msg())
+        }
     }
 }
 
@@ -49,7 +50,7 @@ struct PingerConfig: Codable {
     var showDock: Bool
 }
 
-// Stan anti-flap per-host
+// Anti-flap state per-host
 private struct HostState {
     var consecutiveUp = 0
     var consecutiveDown = 0
@@ -249,7 +250,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         setStatusText("Paused")
         updateAggregateTrayIcon()
 
-        L("start with hosts=\(hosts), monitored=\(stateQ.sync { Array(monitoredHosts) })")
+        AppLogger.L("start with hosts=\(hosts), monitored=\(stateQ.sync { Array(monitoredHosts) })")
 
         autoSaveConfigToDisk()
     }
@@ -398,7 +399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Inline add host row
         menu.addItem(makeInlineAddHostRow())
 
-        // Remove Selected - tylko ten zostawiamy
+        // Remove Selected - only keep this one
         menu.addItem(makeInlineButton(title: "Remove Selected", action: #selector(removeSelectedHostsInline)))
 
         menu.addItem(.separator())
@@ -470,7 +471,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    // MARK: - Targets jako wiersz: [padding][dot][checkbox]
+    // MARK: - Targets as row: [padding][dot][checkbox]
 
     private func makeHostRow(for host: String, checked: Bool) -> NSMenuItem {
         // dot
@@ -835,7 +836,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let enabled = !(UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true)
         UserDefaults.standard.set(enabled, forKey: PrefKey.logsEnabled)
         sender.state = enabled ? .on : .off
-        L("console logs \(enabled ? "enabled" : "disabled")")
+        AppLogger.L("console logs \(enabled ? "enabled" : "disabled")")
         autoSaveConfigToDisk()
     }
 
@@ -955,12 +956,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         task.standardError  = pipe
 
         do {
-            L("exec: \(Config.pingPath) \(task.arguments!.joined(separator: " "))")
+            AppLogger.L("exec: \(Config.pingPath) \(task.arguments!.joined(separator: " "))")
             try task.run()
             task.waitUntilExit()
             return Int(task.terminationStatus) == 0
         } catch {
-            L("ping exec failed: \(error)")
+            AppLogger.L("ping exec failed: \(error)")
             return false
         }
     }
@@ -1133,8 +1134,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let data = try JSONEncoder().encode(cfg)
             let url = try configFileURL()
             try data.write(to: url, options: .atomic)
-            L("config auto-saved to \(url.path)")
-        } catch { L("config auto-save failed: \(error)") }
+            AppLogger.L("config auto-saved to \(url.path)")
+        } catch { AppLogger.L("config auto-save failed: \(error)") }
     }
 
     @discardableResult
@@ -1171,10 +1172,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             savePrefs()
             refreshTargetsSection()
             restartTimerKeepingState()
-            L("config loaded from \(url.path)")
+            AppLogger.L("config loaded from \(url.path)")
             return true
         } catch {
-            L("config load failed: \(error)")
+            AppLogger.L("config load failed: \(error)")
             return false
         }
     }
