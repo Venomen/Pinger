@@ -434,7 +434,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         stateQ.async { [weak self] in
             guard let self else { return }
-            for k in self.hostStates.keys { self.hostStates[k] = HostState() }
+            for k in self.hostStates.keys { 
+                let currentType = self.hostStates[k]?.monitoringType ?? .icmp
+                var newState = HostState()
+                newState.monitoringType = currentType
+                self.hostStates[k] = newState
+            }
         }
 
         setStatusText("Paused")
@@ -1171,7 +1176,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         flapMenu?.items.forEach { $0.state = .off }
         sender.state = .on
         stateQ.sync {
-            for k in self.hostStates.keys { self.hostStates[k] = HostState() }
+            for k in self.hostStates.keys { 
+                let currentType = self.hostStates[k]?.monitoringType ?? .icmp
+                var newState = HostState()
+                newState.monitoringType = currentType
+                self.hostStates[k] = newState
+            }
         }
         autoSaveConfigToDisk()
     }
