@@ -16,6 +16,8 @@ fileprivate enum Config {
     static let pingPath = "/sbin/ping"                   // App Sandbox OFF required
     static let defaultHosts = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
     static let appAuthor = "deregowski.net © 2025"
+    static let httpTimeout: TimeInterval = 5.0
+    static let maxRedirects = 3
 }
 
 fileprivate enum PrefKey {
@@ -27,6 +29,7 @@ fileprivate enum PrefKey {
     static let flap = "flap"
     static let logsEnabled = "logsEnabled"
     static let showDockIcon = "showDockIcon"
+    static let hostMonitoringTypes = "hostMonitoringTypes"
 }
 
 // Simple logger controlled by UserDefaults flag
@@ -34,6 +37,26 @@ private struct AppLogger {
     static func L(_ msg: @autoclosure () -> String) {
         if UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true {
             print(msg())
+        }
+    }
+}
+
+// Monitoring type enum
+enum MonitoringType: String, Codable, CaseIterable {
+    case icmp = "icmp"
+    case http = "http"
+    
+    var displayName: String {
+        switch self {
+        case .icmp: return "ICMP"
+        case .http: return "HTTP"
+        }
+    }
+    
+    var icon: String {
+        switch self {
+        case .icmp: return "waveform.path.ecg"
+        case .http: return "globe"
         }
     }
 }
@@ -48,6 +71,7 @@ struct PingerConfig: Codable {
     var notify: Bool
     var logs: Bool
     var showDock: Bool
+    var hostTypes: [String: String]?  // host -> "icmp"/"http"
 }
 
 // Anti-flap state per-host
@@ -56,6 +80,8 @@ private struct HostState {
     var consecutiveDown = 0
     var lastStableIsUp: Bool? = nil
     var inFlight = false
+    var monitoringType: MonitoringType = .icmp
+    var lastHttpStatus: Int? = nil
 }
 
 // Lightweight menu button with hover/press highlight (doesn't close menu)
@@ -693,6 +719,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             dot.heightAnchor.constraint(equalToConstant: 10)
         ])
 
+        // Monitoring type toggle button (ICMP/HTTP)
+        let typeButton = NSButton(frame: .zero)
+        typeButton.setButtonType(.momentaryPushIn)
+        typeButton.isBordered = false
+        typeButton.bezelStyle = .texturedRounded
+        typeButton.focusRingType = .none
+        
+        let currentType = stateQ.sync { 
+            self.hostStates[host]?.monitoringType ?? .icmp 
+        }
+        typeButton.image = NSImage(systemSymbolName: currentType.icon, 
+                                  accessibilityDescription: currentType.displayName)
+        typeButton.imageScaling = .scaleProportionallyDown
+        typeButton.target = self
+        typeButton.action = #selector(toggleMonitoringType(_:))
+        typeButton.identifier = NSUserInterfaceItemIdentifier("type-\(host)")
+        typeButton.translatesAutoresizingMaskIntoConstraints = false
+        typeButton.toolTip = "Switch to \(currentType == .icmp ? "HTTP" : "ICMP") monitoring"
+        NSLayoutConstraint.activate([
+            typeButton.widthAnchor.constraint(equalToConstant: 16),
+            typeButton.heightAnchor.constraint(equalToConstant: 16)
+        ])
+
         // Use new MenuCheckboxButton instead of NSButton
         let btn = MenuCheckboxButton(frame: .zero)
         btn.title = host
@@ -709,7 +758,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             pad.widthAnchor.constraint(equalToConstant: 12)
         ])
 
-        let stack = NSStackView(views: [pad, dot, btn])
+        let stack = NSStackView(views: [pad, dot, typeButton, btn])
         stack.orientation = .horizontal
         stack.spacing = 6
         stack.alignment = .firstBaseline
@@ -1053,6 +1102,58 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         inlineAddTextField?.stringValue = ""
     }
 
+    @objc private func toggleMonitoringType(_ sender: NSButton) {
+        guard let identifier = sender.identifier?.rawValue,
+              identifier.hasPrefix("type-") else { return }
+        
+        let host = String(identifier.dropFirst(5))
+        
+        stateQ.sync {
+            guard var hostState = self.hostStates[host] else { return }
+            
+            // Toggle type
+            hostState.monitoringType = (hostState.monitoringType == .icmp) ? .http : .icmp
+            
+            // Reset state when changing type
+            hostState.consecutiveUp = 0
+            hostState.consecutiveDown = 0
+            hostState.lastStableIsUp = nil
+            hostState.lastHttpStatus = nil
+            
+            self.hostStates[host] = hostState
+        }
+        
+        // Update UI
+        updateMonitoringTypeIcon(for: host)
+        updateMenuIcon(for: host) // Reset dot to gray
+        
+        // Restart monitoring if running
+        if isRunning {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.pingOne(host: host)
+            }
+        }
+        
+        savePrefs()
+        autoSaveConfigToDisk()
+    }
+
+    private func updateMonitoringTypeIcon(for host: String) {
+        DispatchQueue.main.async {
+            guard let item = self.hostMenuItems[host],
+                  let container = item.view,
+                  let typeButton = container.findSubview(with: NSUserInterfaceItemIdentifier("type-\(host)")) as? NSButton else { return }
+            
+            let currentType = self.stateQ.sync { 
+                self.hostStates[host]?.monitoringType ?? .icmp 
+            }
+            
+            typeButton.image = NSImage(systemSymbolName: currentType.icon, 
+                                      accessibilityDescription: currentType.displayName)
+            typeButton.toolTip = "Switch to \(currentType == .icmp ? "HTTP" : "ICMP") monitoring"
+        }
+    }
+
     @objc private func setInterval(_ sender: NSMenuItem) {
         guard let val = sender.representedObject as? TimeInterval else { return }
         Config.intervalSeconds = val
@@ -1154,7 +1255,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let up = self.runPingOnceICMP(host: host)
+            
+            // Get monitoring type
+            let monitoringType = self.stateQ.sync { 
+                self.hostStates[host]?.monitoringType ?? .icmp 
+            }
+            
+            let up: Bool
+            switch monitoringType {
+            case .icmp:
+                up = self.runPingOnceICMP(host: host)
+            case .http:
+                up = self.runCheckOnceHTTP(host: host)
+            }
 
             var changedTo: Bool? = nil
             self.stateQ.sync {
@@ -1211,6 +1324,89 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             AppLogger.L("ping exec failed: \(error)")
             return false
         }
+    }
+
+    // HTTP checking
+    private func runCheckOnceHTTP(host: String) -> Bool {
+        // Determine URL
+        let urlString: String
+        if host.hasPrefix("http://") || host.hasPrefix("https://") {
+            urlString = host
+        } else {
+            // Default to https, fallback to http
+            urlString = "https://\(host)"
+        }
+        
+        guard let url = URL(string: urlString) else {
+            AppLogger.L("Invalid URL: \(urlString)")
+            return false
+        }
+        
+        return checkHTTPUrl(url: url, redirectCount: 0)
+    }
+
+    private func checkHTTPUrl(url: URL, redirectCount: Int) -> Bool {
+        if redirectCount > Config.maxRedirects {
+            AppLogger.L("Too many redirects for \(url)")
+            return false
+        }
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = Config.httpTimeout
+        request.httpMethod = "HEAD" // Faster than GET
+        request.setValue("Pinger/1.0", forHTTPHeaderField: "User-Agent")
+        
+        let semaphore = DispatchSemaphore(value: 0)
+        var result = false
+        var httpStatus: Int? = nil
+        
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            defer { semaphore.signal() }
+            
+            if let error = error {
+                AppLogger.L("HTTP error for \(url): \(error.localizedDescription)")
+                return
+            }
+            
+            guard let httpResponse = response as? HTTPURLResponse else {
+                AppLogger.L("No HTTP response for \(url)")
+                return
+            }
+            
+            httpStatus = httpResponse.statusCode
+            AppLogger.L("HTTP \(httpStatus!) for \(url)")
+            
+            // Store status for debugging
+            if let host = self?.extractHostFromUrl(url) {
+                self?.stateQ.sync {
+                    self?.hostStates[host]?.lastHttpStatus = httpStatus
+                }
+            }
+            
+            switch httpResponse.statusCode {
+            case 200...299:
+                result = true
+                
+            case 301, 302, 303, 307, 308:
+                // Handle redirects
+                if let locationString = httpResponse.allHeaderFields["Location"] as? String,
+                   let redirectUrl = URL(string: locationString, relativeTo: url) {
+                    result = self?.checkHTTPUrl(url: redirectUrl, redirectCount: redirectCount + 1) ?? false
+                }
+                
+            default:
+                result = false
+            }
+        }
+        
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + Config.httpTimeout + 1)
+        
+        return result
+    }
+
+    private func extractHostFromUrl(_ url: URL) -> String? {
+        return url.host
     }
 
     // MARK: - UI helpers
@@ -1282,8 +1478,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     private func miniDot(for host: String) -> NSImage? {
-        let stable = stateQ.sync { self.hostStates[host]?.lastStableIsUp }
+        let (stable, type, status) = stateQ.sync { 
+            let hostState = self.hostStates[host]
+            return (
+                hostState?.lastStableIsUp,
+                hostState?.monitoringType ?? .icmp,
+                hostState?.lastHttpStatus
+            )
+        }
+        
         let color: NSColor = (stable == nil) ? .systemGray : (stable! ? .systemGreen : .systemRed)
+        
+        // Add tooltip with more info
+        DispatchQueue.main.async {
+            if let item = self.hostMenuItems[host],
+               let container = item.view,
+               let dot = container.findSubview(with: NSUserInterfaceItemIdentifier("dot-\(host)")) as? NSImageView {
+                
+                var tooltip = "\(host) (\(type.displayName))"
+                if let status = status, type == .http {
+                    tooltip += " - HTTP \(status)"
+                }
+                if let stable = stable {
+                    tooltip += stable ? " - UP" : " - DOWN"
+                } else {
+                    tooltip += " - Unknown"
+                }
+                dot.toolTip = tooltip
+            }
+        }
+        
         return NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(paletteColors: [color]))
     }
@@ -1298,6 +1522,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             dot.image = self.miniDot(for: host)
             let checked = self.stateQ.sync { self.monitoredHosts.contains(host) }
             btn.state = checked ? .on : .off
+            
+            // Update monitoring type icon
+            self.updateMonitoringTypeIcon(for: host)
         }
     }
 
@@ -1338,6 +1565,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 ud.set(Array(self.monitoredHosts), forKey: PrefKey.monitored)
             }
             for h in hosts where self.hostStates[h] == nil { self.hostStates[h] = HostState() }
+            
+            // Load monitoring types
+            if let types = ud.object(forKey: PrefKey.hostMonitoringTypes) as? [String: String] {
+                for (host, typeString) in types {
+                    if let type = MonitoringType(rawValue: typeString),
+                       var hostState = self.hostStates[host] {
+                        hostState.monitoringType = type
+                        self.hostStates[host] = hostState
+                    }
+                }
+            }
         }
 
         if ud.object(forKey: PrefKey.notify) == nil { ud.set(true, forKey: PrefKey.notify) }
@@ -1355,6 +1593,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         ud.set(hosts, forKey: PrefKey.hosts)                      // can be empty
         let mon = stateQ.sync { Array(self.monitoredHosts) }
         ud.set(mon, forKey: PrefKey.monitored)                    // can be empty
+        
+        // Save monitoring types
+        let types = stateQ.sync { 
+            self.hostStates.compactMapValues { $0.monitoringType.rawValue }
+        }
+        ud.set(types, forKey: PrefKey.hostMonitoringTypes)
+        
         if let a = activeHost { ud.set(a, forKey: PrefKey.activeHost) }
     }
 
@@ -1368,6 +1613,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private func autoSaveConfigToDisk() {
         do {
+            let hostTypes = stateQ.sync { 
+                self.hostStates.compactMapValues { $0.monitoringType.rawValue }
+            }
+            
             let cfg = PingerConfig(
                 hosts: hosts,
                 monitored: stateQ.sync { Array(self.monitoredHosts) },
@@ -1376,7 +1625,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 flap: Config.upThreshold,
                 notify: isNotificationsEnabled,
                 logs: (UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true),
-                showDock: isDockIconShown
+                showDock: isDockIconShown,
+                hostTypes: hostTypes
             )
             let data = try JSONEncoder().encode(cfg)
             let url = try configFileURL()
@@ -1403,7 +1653,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     self.monitoredHosts = Set(cfg.hosts)
                 }
                 self.hostStates.removeAll()
-                for h in self.hosts { self.hostStates[h] = HostState() }
+                for h in self.hosts { 
+                    var hostState = HostState()
+                    
+                    // Load monitoring type if available
+                    if let hostTypes = cfg.hostTypes,
+                       let typeString = hostTypes[h],
+                       let type = MonitoringType(rawValue: typeString) {
+                        hostState.monitoringType = type
+                    }
+                    
+                    self.hostStates[h] = hostState
+                }
             }
 
             self.activeHost = cfg.activeHost
