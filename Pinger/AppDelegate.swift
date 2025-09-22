@@ -205,18 +205,57 @@ final class PersistentMenuTextField: NSTextField {
         return true
     }
     
-    // Force focus when trying to paste
-    override func keyDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
-            if window?.firstResponder != self {
-                window?.makeFirstResponder(self)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-                    super.keyDown(with: event)
+    // Handle all keyboard input including paste
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Handle Command+V (paste)
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "v" {
+            // Make sure we have focus
+            window?.makeFirstResponder(self)
+            // Small delay to ensure focus is set
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                if let pasteboard = NSPasteboard.general.string(forType: .string) {
+                    self.stringValue = pasteboard
                 }
-                return
             }
+            return true
+        }
+        
+        // Handle Command+A (select all)
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "a" {
+            window?.makeFirstResponder(self)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                if let textEditor = self.currentEditor() {
+                    textEditor.selectAll(self)
+                }
+            }
+            return true
+        }
+        
+        // Handle Command+C (copy)
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "c" {
+            window?.makeFirstResponder(self)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(self.stringValue, forType: .string)
+            }
+            return true
+        }
+        
+        return super.performKeyEquivalent(with: event)
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        // Ensure we maintain focus
+        if window?.firstResponder != self {
+            window?.makeFirstResponder(self)
         }
         super.keyDown(with: event)
+    }
+    
+    // Override becomeFirstResponder to be more aggressive
+    override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        return result
     }
 }
 
@@ -307,6 +346,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         AppLogger.L("start with hosts=\(hosts), monitored=\(stateQ.sync { Array(monitoredHosts) })")
 
         autoSaveConfigToDisk()
+        
+        // Set up global keyboard monitoring for paste when menu is open
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, self.menuOpen else { return event }
+            
+            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "v" {
+                if let textField = self.inlineAddTextField {
+                    textField.window?.makeFirstResponder(textField)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                        if let pasteboard = NSPasteboard.general.string(forType: .string) {
+                            textField.stringValue = pasteboard
+                        }
+                    }
+                    return nil // consume the event
+                }
+            }
+            return event
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -801,10 +858,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func menuWillOpen(_ menu: NSMenu) { 
         menuOpen = true
         updateErrorState() // Check error state when opening menu
+        
+        // Try to set focus to text field when menu opens
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            if let textField = self.inlineAddTextField {
+                textField.window?.makeFirstResponder(textField)
+            }
+        }
     }
     
     func menuDidClose(_ menu: NSMenu) { 
         menuOpen = false 
+    }
+    
+    // Add menu-level keyboard handling
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        // This helps maintain keyboard focus context
     }
 
     // MARK: - Actions
