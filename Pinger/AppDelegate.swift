@@ -855,8 +855,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let desc =
         """
         A tiny menu bar monitor that pings selected hosts in parallel.
-        Uses /sbin/ping (ICMP). Requires App Sandbox OFF and /sbin/ping at that path.
-        Anti-flap stabilization and notifications built-in. Config file is JSON, autosaved.
         """
         let alert = NSAlert()
         alert.messageText = "Pinger"
