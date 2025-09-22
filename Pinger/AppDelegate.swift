@@ -169,6 +169,57 @@ final class MenuCheckboxButton: NSButton {
     }
 }
 
+// TextField with persistent focus for menu use
+final class PersistentMenuTextField: NSTextField {
+    
+    override func awakeFromNib() {
+        super.awakeFromNib()
+        setupTextField()
+    }
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupTextField()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupTextField()
+    }
+    
+    private func setupTextField() {
+        refusesFirstResponder = false
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        // Always try to become first responder on click
+        window?.makeFirstResponder(self)
+    }
+    
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+    
+    override var acceptsFirstResponder: Bool {
+        return true
+    }
+    
+    // Force focus when trying to paste
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
+            if window?.firstResponder != self {
+                window?.makeFirstResponder(self)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                    super.keyDown(with: event)
+                }
+                return
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
 private extension CALayer {
     func animate(keyPath: String, from: Any?, to: Any?, duration: TimeInterval) {
         let anim = CABasicAnimation(keyPath: keyPath)
@@ -215,6 +266,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     
     // Toggle all targets button
     private var toggleAllButton: NSButton?
+    
+    // Inline error message
+    private var errorMessageItem: NSMenuItem?
 
     // Prefs
     private var isNotificationsEnabled: Bool {
@@ -303,6 +357,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         setStatusText("Paused")
         setTrayIcon(color: .systemGray, tooltip: "Paused")
         refreshTargetsSection()
+        updateErrorState() // Check for errors when stopping
     }
 
     private func restartTimerKeepingState() {
@@ -335,6 +390,86 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         mi.view = container            // height comes from container frame (24)
         return mi
     }
+    
+    /// Creates an inline error message that appears in the menu
+    private func makeErrorMessage(text: String) -> NSMenuItem {
+        let rowHeight: CGFloat = 24
+        let leftPadding: CGFloat = 12
+        let rightPadding: CGFloat = 8
+        let totalWidth: CGFloat = 260
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: totalWidth, height: rowHeight))
+
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .systemRed
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leftPadding),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -rightPadding),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+
+        let mi = NSMenuItem()
+        mi.view = container
+        mi.isEnabled = false
+        return mi
+    }
+    
+    /// Shows inline error message in menu
+    private func showInlineError(_ message: String) {
+        guard let menu = statusItem.menu else { return }
+        
+        // Remove existing error message if any
+        hideInlineError()
+        
+        // Find Start/Stop button position
+        var insertIndex: Int?
+        for (i, item) in menu.items.enumerated() {
+            if item == startStopMenuItem {
+                insertIndex = i + 1
+                break
+            }
+        }
+        
+        guard let index = insertIndex else { return }
+        
+        let errorItem = makeErrorMessage(text: message)
+        menu.insertItem(errorItem, at: index)
+        errorMessageItem = errorItem
+    }
+    
+    /// Hides inline error message from menu
+    private func hideInlineError() {
+        guard let errorItem = errorMessageItem,
+              let menu = statusItem.menu else { return }
+        
+        menu.removeItem(errorItem)
+        errorMessageItem = nil
+    }
+    
+    /// Checks current state and shows appropriate error message if needed
+    private func updateErrorState() {
+        // Only show errors when not running
+        guard !isRunning else {
+            hideInlineError()
+            return
+        }
+        
+        if hosts.isEmpty {
+            showInlineError("⚠️ Add a host before starting")
+        } else {
+            let anySelected = stateQ.sync { !self.monitoredHosts.isEmpty }
+            if !anySelected {
+                showInlineError("⚠️ Select at least one target to monitor")
+            } else {
+                hideInlineError()
+            }
+        }
+    }
 
 
     // MARK: - Menu
@@ -349,8 +484,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         statusMenuItem = status
         menu.addItem(.separator())
 
-        let startStop = NSMenuItem(title: "Start", action: #selector(toggleStartStop), keyEquivalent: "s")
-        startStop.target = self
+        let startStop = makeInlineButton(title: "Start", action: #selector(toggleStartStop))
         menu.addItem(startStop)
         startStopMenuItem = startStop
 
@@ -378,14 +512,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         toggleButton.imageScaling = .scaleProportionallyDown
         toggleAllButton = toggleButton
         
+        let removeButton = NSButton(frame: .zero)
+        removeButton.setButtonType(.momentaryPushIn)
+        removeButton.isBordered = false
+        removeButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Remove Selected")
+        removeButton.target = self
+        removeButton.action = #selector(removeSelectedHostsInline)
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+        removeButton.imageScaling = .scaleProportionallyDown
+        
         headerContainer.addSubview(headerLabel)
         headerContainer.addSubview(toggleButton)
+        headerContainer.addSubview(removeButton)
         
         NSLayoutConstraint.activate([
             headerLabel.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor, constant: 12),
             headerLabel.centerYAnchor.constraint(equalTo: headerContainer.centerYAnchor),
             
-            toggleButton.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -12),
+            removeButton.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -12),
+            removeButton.centerYAnchor.constraint(equalTo: headerContainer.centerYAnchor),
+            removeButton.widthAnchor.constraint(equalToConstant: 16),
+            removeButton.heightAnchor.constraint(equalToConstant: 16),
+            
+            toggleButton.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -8),
             toggleButton.centerYAnchor.constraint(equalTo: headerContainer.centerYAnchor),
             toggleButton.widthAnchor.constraint(equalToConstant: 16),
             toggleButton.heightAnchor.constraint(equalToConstant: 16)
@@ -398,9 +547,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Inline add host row
         menu.addItem(makeInlineAddHostRow())
-
-        // Remove Selected - only keep this one
-        menu.addItem(makeInlineButton(title: "Remove Selected", action: #selector(removeSelectedHostsInline)))
 
         menu.addItem(.separator())
 
@@ -467,7 +613,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private func updateStartStopTitle() {
         DispatchQueue.main.async {
-            self.startStopMenuItem?.title = self.isRunning ? "Stop" : "Start"
+            // Find HoverMenuButton in the container
+            if let container = self.startStopMenuItem?.view,
+               let button = container.subviews.first(where: { $0 is HoverMenuButton }) as? HoverMenuButton {
+                button.title = self.isRunning ? "Stop" : "Start"
+            }
         }
     }
 
@@ -534,12 +684,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let container = NSView(frame: NSRect(x: 0, y: 0, width: totalWidth, height: rowHeight))
 
         // TextField
-        let textField = NSTextField(frame: .zero)
-        textField.placeholderString = "Enter IP or hostname..."
+        let textField = PersistentMenuTextField(frame: .zero)
+        textField.placeholderString = "IP or host"
         textField.identifier = NSUserInterfaceItemIdentifier("addHostField")
         textField.target = self
         textField.action = #selector(addHostInline(_:))
         textField.translatesAutoresizingMaskIntoConstraints = false
+        
+        // Enable standard text editing behavior (copy/paste/select all)
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.allowsEditingTextAttributes = false
+        textField.importsGraphics = false
+        textField.refusesFirstResponder = false
+        
         inlineAddTextField = textField
 
         // Add button
@@ -565,16 +723,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             textField.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             textField.heightAnchor.constraint(equalToConstant: 22),
             
-            addBtn.leadingAnchor.constraint(equalTo: textField.trailingAnchor, constant: 4),
+            addBtn.leadingAnchor.constraint(equalTo: textField.trailingAnchor, constant: 6),
             addBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            addBtn.widthAnchor.constraint(equalToConstant: 40),
-            addBtn.heightAnchor.constraint(equalToConstant: 22),
+            addBtn.widthAnchor.constraint(equalToConstant: 44),
+            addBtn.heightAnchor.constraint(equalToConstant: 24),
             
-            clearBtn.leadingAnchor.constraint(equalTo: addBtn.trailingAnchor, constant: 2),
+            clearBtn.leadingAnchor.constraint(equalTo: addBtn.trailingAnchor, constant: 4),
             clearBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -rightPadding),
             clearBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            clearBtn.widthAnchor.constraint(equalToConstant: 40),
-            clearBtn.heightAnchor.constraint(equalToConstant: 22)
+            clearBtn.widthAnchor.constraint(equalToConstant: 44),
+            clearBtn.heightAnchor.constraint(equalToConstant: 24)
         ])
 
         let mi = NSMenuItem()
@@ -636,31 +794,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         
         updateToggleButtonIcon()
+        updateErrorState()
     }
 
     // MARK: - Menu delegate
-    func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+    func menuWillOpen(_ menu: NSMenu) { 
+        menuOpen = true
+        updateErrorState() // Check error state when opening menu
+    }
+    
+    func menuDidClose(_ menu: NSMenu) { 
+        menuOpen = false 
+    }
 
     // MARK: - Actions
 
     @objc private func toggleStartStop() {
         if isRunning {
             stopTimer()
+            // Don't close menu after Stop - let user see the status
             return
         }
+        
+        // Check if we can start
         if hosts.isEmpty {
-            showInfoAlert(title: "No Hosts", 
-                          text: "Add a host before starting.")
+            updateErrorState() // This will show the appropriate error
             return
         }
         let anySelected = stateQ.sync { !self.monitoredHosts.isEmpty }
         if !anySelected {
-            showInfoAlert(title: "No targets selected",
-                          text: "Select at least one target in the “Targets” section.")
+            updateErrorState() // This will show the appropriate error
             return
         }
+        
+        // Start successfully
+        hideInlineError()
         startTimer()
+        // Close menu after successful start
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.statusItem.menu?.cancelTracking()
+        }
     }
 
     /// Checkbox in host row (normal click, ⌥ solo, ⌘ invert selection)
@@ -694,6 +867,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
             updateMenuIcon(for: host)
             updateToggleButtonIcon()
+            updateErrorState() // Update error state when selection changes
         }
 
         sender.state = desiredOn ? .on : .off
@@ -772,31 +946,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     @objc private func addHostInline(_ sender: Any) {
         guard let textField = inlineAddTextField else { return }
-        let newHost = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !newHost.isEmpty else { 
-            NSSound.beep()
-            return 
-        }
         
-        if !hosts.contains(newHost) {
-            hosts.insert(newHost, at: 0)
-            stateQ.sync {
-                self.monitoredHosts.insert(newHost)
-                self.hostStates[newHost] = HostState()
+        // If this was called by clicking the Add button or pressing Enter,
+        // process the text field content
+        if sender is HoverMenuButton || sender is NSTextField {
+            let newHost = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !newHost.isEmpty else { 
+                NSSound.beep()
+                return 
             }
-            savePrefs()
-            refreshTargetsSection()
-            autoSaveConfigToDisk()
-            textField.stringValue = ""
-            updateToggleButtonIcon()
             
-            if isRunning {
-                DispatchQueue.global(qos: .utility).async { [weak self] in 
-                    self?.pingOne(host: newHost) 
+            if !hosts.contains(newHost) {
+                hosts.insert(newHost, at: 0)
+                stateQ.sync {
+                    self.monitoredHosts.insert(newHost)
+                    self.hostStates[newHost] = HostState()
                 }
+                savePrefs()
+                refreshTargetsSection()
+                autoSaveConfigToDisk()
+                textField.stringValue = ""
+                updateToggleButtonIcon()
+                updateErrorState() // Update error state when hosts change
+                
+                if isRunning {
+                    DispatchQueue.global(qos: .utility).async { [weak self] in 
+                        self?.pingOne(host: newHost) 
+                    }
+                }
+            } else {
+                NSSound.beep()
             }
-        } else {
-            NSSound.beep()
         }
     }
 
