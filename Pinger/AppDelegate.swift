@@ -113,6 +113,60 @@ final class HoverMenuButton: NSButton {
     }
 }
 
+// Checkbox który nie zamyka menu
+final class MenuCheckboxButton: NSButton {
+    private var tracking: NSTrackingArea?
+    private let hoverColor = NSColor.controlAccentColor.withAlphaComponent(0.08)
+    private let normalColor = NSColor.clear
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setButtonType(.switch)
+        isBordered = false
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.backgroundColor = normalColor.cgColor
+    }
+    
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = tracking { removeTrackingArea(t) }
+        let opts: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        tracking = NSTrackingArea(rect: bounds, options: opts, owner: self, userInfo: nil)
+        if let t = tracking { addTrackingArea(t) }
+    }
+    
+    override func mouseEntered(with event: NSEvent) {
+        animateBackground(to: hoverColor)
+    }
+    
+    override func mouseExited(with event: NSEvent) {
+        animateBackground(to: normalColor)
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        // Przełącz stan
+        state = (state == .on) ? .off : .on
+        // Wywołaj akcję
+        sendAction(action, to: target)
+        // Nie wywołuj super.mouseDown - to zapobiega domyślnemu zachowaniu
+    }
+    
+    private func animateBackground(to color: NSColor) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            self.layer?.animate(keyPath: "backgroundColor",
+                                from: self.layer?.backgroundColor,
+                                to: color.cgColor,
+                                duration: ctx.duration)
+            self.layer?.backgroundColor = color.cgColor
+        }
+    }
+}
+
 private extension CALayer {
     func animate(keyPath: String, from: Any?, to: Any?, duration: TimeInterval) {
         let anim = CABasicAnimation(keyPath: keyPath)
@@ -153,6 +207,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     // Anti-flicker w statusie
     private var menuOpen = false
     private var lastStatusText = ""
+
+    // Inline add host field
+    private var inlineAddTextField: NSTextField?
+    
+    // Toggle all targets button
+    private var toggleAllButton: NSButton?
 
     // Preferencje
     private var isNotificationsEnabled: Bool {
@@ -294,22 +354,51 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         menu.addItem(.separator())
 
+        // Header "Targets" z toggle button
         let header = NSMenuItem(title: "Targets", action: nil, keyEquivalent: "")
         header.isEnabled = false
+        
+        // Stwórz custom view dla header z ikoną toggle
+        let headerContainer = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        
+        let headerLabel = NSTextField(labelWithString: "Targets")
+        headerLabel.font = NSFont.menuFont(ofSize: 13)
+        headerLabel.textColor = NSColor.secondaryLabelColor
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        
+        let toggleButton = NSButton(frame: .zero)
+        toggleButton.setButtonType(.momentaryPushIn)
+        toggleButton.isBordered = false
+        toggleButton.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: "Toggle All")
+        toggleButton.target = self
+        toggleButton.action = #selector(toggleAllTargets)
+        toggleButton.translatesAutoresizingMaskIntoConstraints = false
+        toggleButton.imageScaling = .scaleProportionallyDown
+        toggleAllButton = toggleButton
+        
+        headerContainer.addSubview(headerLabel)
+        headerContainer.addSubview(toggleButton)
+        
+        NSLayoutConstraint.activate([
+            headerLabel.leadingAnchor.constraint(equalTo: headerContainer.leadingAnchor, constant: 12),
+            headerLabel.centerYAnchor.constraint(equalTo: headerContainer.centerYAnchor),
+            
+            toggleButton.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -12),
+            toggleButton.centerYAnchor.constraint(equalTo: headerContainer.centerYAnchor),
+            toggleButton.widthAnchor.constraint(equalToConstant: 16),
+            toggleButton.heightAnchor.constraint(equalToConstant: 16)
+        ])
+        
+        header.view = headerContainer
         menu.addItem(header)
         menu.addItem(.separator())
         refreshTargetsSection(in: menu)
 
-        // „Add Host…” może zamknąć menu (standardowo otwiera dialog) – zostawiamy jako zwykły item.
-        let addItem = NSMenuItem(title: "Add Host…", action: #selector(addHost), keyEquivalent: "a")
-        addItem.target = self
-        menu.addItem(addItem)
+        // Inline add host row
+        menu.addItem(makeInlineAddHostRow())
 
-        // ⬇⬇⬇ Te trzy jako widoki — klik NIE zamyka menu:
+        // Remove Selected - tylko ten zostawiamy
         menu.addItem(makeInlineButton(title: "Remove Selected", action: #selector(removeSelectedHostsInline)))
-        menu.addItem(makeInlineButton(title: "Select All Targets", action: #selector(selectAllTargetsInline)))
-        menu.addItem(makeInlineButton(title: "Deselect All Targets", action: #selector(deselectAllTargetsInline)))
-        // ⬆⬆⬆
 
         menu.addItem(.separator())
 
@@ -395,11 +484,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             dot.heightAnchor.constraint(equalToConstant: 10)
         ])
 
-        // checkbox
-        let btn = NSButton(checkboxWithTitle: host, target: self, action: #selector(hostCheckboxToggled(_:)))
+        // Użyj nowego MenuCheckboxButton zamiast NSButton
+        let btn = MenuCheckboxButton(frame: .zero)
+        btn.title = host
         btn.identifier = NSUserInterfaceItemIdentifier(host)
         btn.state = checked ? .on : .off
-        btn.isBordered = false
+        btn.target = self
+        btn.action = #selector(hostCheckboxToggled(_:))
         btn.translatesAutoresizingMaskIntoConstraints = false
 
         // padding po lewej (12pt)
@@ -431,6 +522,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         return mi
     }
 
+    // Dodaj nową metodę
+    private func makeInlineAddHostRow() -> NSMenuItem {
+        let rowHeight: CGFloat = 28
+        let leftPadding: CGFloat = 12
+        let rightPadding: CGFloat = 8
+        let totalWidth: CGFloat = 260
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: totalWidth, height: rowHeight))
+
+        // TextField
+        let textField = NSTextField(frame: .zero)
+        textField.placeholderString = "Enter IP or hostname..."
+        textField.identifier = NSUserInterfaceItemIdentifier("addHostField")
+        textField.target = self
+        textField.action = #selector(addHostInline(_:))
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        inlineAddTextField = textField
+
+        // Add button
+        let addBtn = HoverMenuButton(frame: .zero)
+        addBtn.title = "Add"
+        addBtn.target = self
+        addBtn.action = #selector(addHostInline(_:))
+        addBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        // Clear button
+        let clearBtn = HoverMenuButton(frame: .zero)
+        clearBtn.title = "Clear"
+        clearBtn.target = self
+        clearBtn.action = #selector(clearAddHostField)
+        clearBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(textField)
+        container.addSubview(addBtn)
+        container.addSubview(clearBtn)
+
+        NSLayoutConstraint.activate([
+            textField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leftPadding),
+            textField.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            textField.heightAnchor.constraint(equalToConstant: 22),
+            
+            addBtn.leadingAnchor.constraint(equalTo: textField.trailingAnchor, constant: 4),
+            addBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            addBtn.widthAnchor.constraint(equalToConstant: 40),
+            addBtn.heightAnchor.constraint(equalToConstant: 22),
+            
+            clearBtn.leadingAnchor.constraint(equalTo: addBtn.trailingAnchor, constant: 2),
+            clearBtn.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -rightPadding),
+            clearBtn.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            clearBtn.widthAnchor.constraint(equalToConstant: 40),
+            clearBtn.heightAnchor.constraint(equalToConstant: 22)
+        ])
+
+        let mi = NSMenuItem()
+        mi.view = container
+        return mi
+    }
+
     private func refreshTargetsSection(in menu: NSMenu? = nil) {
         let m = menu ?? statusItem.menu!
 
@@ -440,9 +589,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             if item.title == "Targets" && !item.isEnabled { startIdx = i + 1 }
             else if startIdx != nil && item.isSeparatorItem { endIdx = i; break }
         }
+        
+        // Znajdź pozycję inline add host row (nie usuwaj go)
+        var addHostRowIdx: Int?
+        if let s = startIdx, let e = endIdx {
+            for i in s..<e {
+                if let view = m.item(at: i)?.view,
+                   view.subviews.contains(where: { $0.identifier?.rawValue == "addHostField" }) {
+                    addHostRowIdx = i
+                    break
+                }
+            }
+        }
+        
         if let s = startIdx, let e = endIdx, e > s {
             hostMenuItems.removeAll()
-            for _ in s..<e { m.removeItem(at: s) }
+            for i in (s..<e).reversed() {
+                // Nie usuwaj add host row
+                if i != addHostRowIdx {
+                    m.removeItem(at: i)
+                }
+            }
         }
 
         stateQ.sync {
@@ -454,12 +621,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let monSnap = stateQ.sync { self.monitoredHosts }
         var insertAt = startIdx ?? 1
 
+        // Jeśli add host row istnieje, wstaw hosty przed nim
+        if let addRowIdx = addHostRowIdx {
+            insertAt = addRowIdx
+        }
+
         for host in hosts {
             let row = makeHostRow(for: host, checked: monSnap.contains(host))
             m.insertItem(row, at: insertAt)
             hostMenuItems[host] = row
             insertAt += 1
         }
+        
+        updateToggleButtonIcon()
     }
 
     // MARK: - Menu delegate
@@ -474,8 +648,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return
         }
         if hosts.isEmpty {
-            showInfoAlert(title: "No hosts added",
-                          text: "Add a host via “Add Host…” before starting.")
+            showInfoAlert(title: "No Hosts", 
+                          text: "Add a host before starting.")
             return
         }
         let anySelected = stateQ.sync { !self.monitoredHosts.isEmpty }
@@ -506,6 +680,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 }
             }
             refreshTargetsSection()
+            updateToggleButtonIcon()
         } else {
             stateQ.sync {
                 if desiredOn {
@@ -516,6 +691,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 }
             }
             updateMenuIcon(for: host)
+            updateToggleButtonIcon()
         }
 
         sender.state = desiredOn ? .on : .off
@@ -532,19 +708,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     // ————— Inline (nie zamykają menu) —————
 
-    @objc private func selectAllTargetsInline() {
-        selectAllTargets()
-        refreshTargetsSection() // odśwież listę „w locie”
-    }
-
-    @objc private func deselectAllTargetsInline() {
-        deselectAllTargets()
-        refreshTargetsSection()
+    @objc private func toggleAllTargets() {
+        let currentMonitored = stateQ.sync { self.monitoredHosts }
+        
+        // Jeśli wszystkie hosty są monitorowane, odznacz wszystkie
+        // W przeciwnym razie zaznacz wszystkie
+        if currentMonitored.count == hosts.count && !hosts.isEmpty {
+            deselectAllTargets()
+        } else {
+            selectAllTargets()
+        }
+        refreshTargetsSection() // odśwież listę „w locie"
+        updateToggleButtonIcon()
     }
 
     @objc private func removeSelectedHostsInline() {
         removeSelectedHosts()
         refreshTargetsSection()
+        updateToggleButtonIcon()
     }
 
     // ——— Te metody mogą być też wołane z innych miejsc ———
@@ -566,34 +747,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         updateAggregateTrayIcon()
     }
 
-    @objc private func addHost() {
-        let alert = NSAlert()
-        alert.messageText = "Add Host"
-        alert.informativeText = "Enter IP or hostname to monitor."
-        let tf = NSTextField(string: "")
-        tf.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
-        alert.accessoryView = tf
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            let newHost = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !newHost.isEmpty else { return }
-            if !hosts.contains(newHost) {
-                hosts.insert(newHost, at: 0)
-                stateQ.sync {
-                    self.monitoredHosts.insert(newHost)
-                    self.hostStates[newHost] = HostState()
-                }
-                savePrefs()
-                refreshTargetsSection()
-                autoSaveConfigToDisk()
-                if isRunning {
-                    DispatchQueue.global(qos: .utility).async { [weak self] in self?.pingOne(host: newHost) }
-                }
-            }
-        }
-    }
-
     @objc private func removeSelectedHosts() {
         let selected = stateQ.sync { self.monitoredHosts }
         if selected.isEmpty {
@@ -613,6 +766,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         savePrefs()
         autoSaveConfigToDisk()
         updateAggregateTrayIcon()
+    }
+
+    @objc private func addHostInline(_ sender: Any) {
+        guard let textField = inlineAddTextField else { return }
+        let newHost = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newHost.isEmpty else { 
+            NSSound.beep()
+            return 
+        }
+        
+        if !hosts.contains(newHost) {
+            hosts.insert(newHost, at: 0)
+            stateQ.sync {
+                self.monitoredHosts.insert(newHost)
+                self.hostStates[newHost] = HostState()
+            }
+            savePrefs()
+            refreshTargetsSection()
+            autoSaveConfigToDisk()
+            textField.stringValue = ""
+            updateToggleButtonIcon()
+            
+            if isRunning {
+                DispatchQueue.global(qos: .utility).async { [weak self] in 
+                    self?.pingOne(host: newHost) 
+                }
+            }
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    @objc private func clearAddHostField() {
+        inlineAddTextField?.stringValue = ""
     }
 
     @objc private func setInterval(_ sender: NSMenuItem) {
@@ -826,6 +1013,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             setTrayIcon(color: .systemGreen, tooltip: "All hosts up")
         }
         // w trakcie stabilizacji utrzymujemy poprzedni kolor
+    }
+
+    private func updateToggleButtonIcon() {
+        DispatchQueue.main.async {
+            guard let button = self.toggleAllButton else { return }
+            
+            let currentMonitored = self.stateQ.sync { self.monitoredHosts }
+            let allSelected = currentMonitored.count == self.hosts.count && !self.hosts.isEmpty
+            
+            // Jeśli wszystkie są zaznaczone - pokaż ikonę do odznaczenia
+            // Jeśli nie wszystkie - pokaż ikonę do zaznaczenia
+            let iconName = allSelected ? "checkmark.circle.fill" : "checkmark.circle"
+            button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: "Toggle All")
+            
+            // Tooltip
+            button.toolTip = allSelected ? "Deselect All Targets" : "Select All Targets"
+        }
     }
 
     private func miniDot(for host: String) -> NSImage? {
