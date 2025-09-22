@@ -20,7 +20,7 @@ fileprivate enum Config {
 
 fileprivate enum PrefKey {
     static let hosts = "hosts"
-    static let activeHost = "activeHost"     // legacy (do migracji)
+    static let activeHost = "activeHost"     // legacy (for migration)
     static let monitored = "monitoredHosts"  // multi-select
     static let notify = "notify"
     static let interval = "interval"
@@ -29,14 +29,15 @@ fileprivate enum PrefKey {
     static let showDockIcon = "showDockIcon"
 }
 
-// Prosty logger sterowany flagą w UserDefaults
+// Simple logger controlled by UserDefaults flag
+private struct AppLogger {
 private func L(_ msg: @autoclosure () -> String) {
     if UserDefaults.standard.object(forKey: PrefKey.logsEnabled) as? Bool ?? true {
         print(msg())
     }
 }
 
-// Model JSON dla configu
+// Model JSON config
 struct PingerConfig: Codable {
     var hosts: [String]
     var monitored: [String]?
@@ -56,7 +57,7 @@ private struct HostState {
     var inFlight = false
 }
 
-// Lekki przycisk do menu z hover/press highlight (menu nie zamyka się)
+// Lightweight menu button with hover/press highlight (doesn't close menu)
 final class HoverMenuButton: NSButton {
     private var tracking: NSTrackingArea?
     private let hoverColor = NSColor.controlAccentColor.withAlphaComponent(0.16)
@@ -93,9 +94,9 @@ final class HoverMenuButton: NSButton {
 
     override func mouseDown(with event: NSEvent) {
         animateBackground(to: pressColor)
-        // wywołaj akcję tak jak zwykły przycisk (menu zostaje otwarte)
+                // call action like a regular button (menu stays open)
         sendAction(action, to: target)
-        // krótkie „wygaszenie” po kliknięciu
+        // brief "fade out" after click
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
             self?.animateBackground(to: self?.hoverColor ?? .clear)
         }
@@ -113,7 +114,7 @@ final class HoverMenuButton: NSButton {
     }
 }
 
-// Checkbox który nie zamyka menu
+// Checkbox that doesn't close menu
 final class MenuCheckboxButton: NSButton {
     private var tracking: NSTrackingArea?
     private let hoverColor = NSColor.controlAccentColor.withAlphaComponent(0.08)
@@ -148,11 +149,11 @@ final class MenuCheckboxButton: NSButton {
     }
     
     override func mouseDown(with event: NSEvent) {
-        // Przełącz stan
+        // Toggle state
         state = (state == .on) ? .off : .on
-        // Wywołaj akcję
+        // Call action
         sendAction(action, to: target)
-        // Nie wywołuj super.mouseDown - to zapobiega domyślnemu zachowaniu
+        // Don't call super.mouseDown - this prevents default behavior
     }
     
     private func animateBackground(to color: NSColor) {
@@ -194,17 +195,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     // Model
     private var hosts: [String] = []
-    private var activeHost: String?              // legacy (dla migracji)
+    private var activeHost: String?              // legacy (for migration)
 
-    // 🔒 Wspólny stan chroniony kolejką szeregową
-    private let stateQ = DispatchQueue(label: "net.deregowski.Pinger.state")
-    private var monitoredHosts = Set<String>()           // chronione przez stateQ
-    private var hostStates: [String: HostState] = [:]    // chronione przez stateQ
+        // Shared state protected by serial queue
+    private let stateQ = DispatchQueue(label: "app.pinger.state")
+    private var monitoredHosts = Set<String>()           // secured by stateQ
+    private var hostStates: [String: HostState] = [:]    // secured by stateQ
 
-    // Mapowanie host -> pozycja menu (dla szybkiej aktualizacji ikon)
+    // Mapping host -> menu item (for quick icon updates)
     private var hostMenuItems: [String: NSMenuItem] = [:]
 
-    // Anti-flicker w statusie
+    // Anti-flicker in status
     private var menuOpen = false
     private var lastStatusText = ""
 
@@ -214,7 +215,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     // Toggle all targets button
     private var toggleAllButton: NSButton?
 
-    // Preferencje
+    // Prefs
     private var isNotificationsEnabled: Bool {
         get { UserDefaults.standard.object(forKey: PrefKey.notify) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: PrefKey.notify) }
@@ -224,7 +225,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         set { UserDefaults.standard.set(newValue, forKey: PrefKey.showDockIcon) }
     }
 
-    // MARK: - Cykl życia
+    // MARK: - Lifecycle
     func applicationDidFinishLaunching(_ notification: Notification) {
         applyActivationPolicyFromPrefs()
 
@@ -258,7 +259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         autoSaveConfigToDisk()
     }
 
-    // MARK: - Ikona w Docku
+    // MARK: - Dock Icon
     private func applyActivationPolicyFromPrefs() {
         NSApp.setActivationPolicy(isDockIconShown ? .regular : .accessory)
     }
@@ -307,12 +308,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if isRunning { startTimer() }
     }
 
-    /// Tworzy „płaski” przycisk jako widok menu z podświetleniem hover/press.
+    /// Creates a "flat" button as menu view with hover/press highlighting.
     private func makeInlineButton(title: String, action: Selector) -> NSMenuItem {
         let rowHeight: CGFloat = 24
         let leftPadding: CGFloat = 12
         let rightPadding: CGFloat = 8
-        let totalWidth: CGFloat = 260   // możesz dostroić
+        let totalWidth: CGFloat = 260   // you can adjust
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: totalWidth, height: rowHeight))
 
@@ -330,7 +331,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         container.addSubview(btn)
 
         let mi = NSMenuItem()
-        mi.view = container            // wysokość bierze się z frame kontenera (24)
+        mi.view = container            // height comes from container frame (24)
         return mi
     }
 
@@ -354,11 +355,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         menu.addItem(.separator())
 
-        // Header "Targets" z toggle button
+        // Header "Targets" with toggle button
         let header = NSMenuItem(title: "Targets", action: nil, keyEquivalent: "")
         header.isEnabled = false
         
-        // Stwórz custom view dla header z ikoną toggle
+        // Create custom view for header with toggle icon
         let headerContainer = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         
         let headerLabel = NSTextField(labelWithString: "Targets")
@@ -484,7 +485,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             dot.heightAnchor.constraint(equalToConstant: 10)
         ])
 
-        // Użyj nowego MenuCheckboxButton zamiast NSButton
+        // Use new MenuCheckboxButton instead of NSButton
         let btn = MenuCheckboxButton(frame: .zero)
         btn.title = host
         btn.identifier = NSUserInterfaceItemIdentifier(host)
@@ -493,7 +494,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         btn.action = #selector(hostCheckboxToggled(_:))
         btn.translatesAutoresizingMaskIntoConstraints = false
 
-        // padding po lewej (12pt)
+        // left padding (12pt)
         let pad = NSView(frame: .zero)
         pad.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -522,7 +523,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         return mi
     }
 
-    // Dodaj nową metodę
+    // Add new method
     private func makeInlineAddHostRow() -> NSMenuItem {
         let rowHeight: CGFloat = 28
         let leftPadding: CGFloat = 12
@@ -590,7 +591,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             else if startIdx != nil && item.isSeparatorItem { endIdx = i; break }
         }
         
-        // Znajdź pozycję inline add host row (nie usuwaj go)
+        // Find position of inline add host row (don't delete it)
         var addHostRowIdx: Int?
         if let s = startIdx, let e = endIdx {
             for i in s..<e {
@@ -605,7 +606,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if let s = startIdx, let e = endIdx, e > s {
             hostMenuItems.removeAll()
             for i in (s..<e).reversed() {
-                // Nie usuwaj add host row
+                // Don't delete add host row
                 if i != addHostRowIdx {
                     m.removeItem(at: i)
                 }
@@ -621,7 +622,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let monSnap = stateQ.sync { self.monitoredHosts }
         var insertAt = startIdx ?? 1
 
-        // Jeśli add host row istnieje, wstaw hosty przed nim
+        // If add host row exists, insert hosts before it
         if let addRowIdx = addHostRowIdx {
             insertAt = addRowIdx
         }
@@ -640,7 +641,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
-    // MARK: - Akcje
+    // MARK: - Actions
 
     @objc private func toggleStartStop() {
         if isRunning {
@@ -661,7 +662,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         startTimer()
     }
 
-    /// Checkbox w wierszu hosta (zwykły klik, ⌥ solo, ⌘ odwróć zaznaczenie)
+    /// Checkbox in host row (normal click, ⌥ solo, ⌘ invert selection)
     @objc private func hostCheckboxToggled(_ sender: NSButton) {
         guard let host = sender.identifier?.rawValue else { return }
         let modifiers = NSApp.currentEvent?.modifierFlags ?? []
@@ -706,19 +707,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    // ————— Inline (nie zamykają menu) —————
+    // ————— Inline (don't close menu) —————
 
     @objc private func toggleAllTargets() {
         let currentMonitored = stateQ.sync { self.monitoredHosts }
         
-        // Jeśli wszystkie hosty są monitorowane, odznacz wszystkie
-        // W przeciwnym razie zaznacz wszystkie
+        // If all hosts are monitored, deselect all
+        // Otherwise select all
         if currentMonitored.count == hosts.count && !hosts.isEmpty {
             deselectAllTargets()
         } else {
             selectAllTargets()
         }
-        refreshTargetsSection() // odśwież listę „w locie"
+        refreshTargetsSection() // refresh list "on the fly"
         updateToggleButtonIcon()
     }
 
@@ -728,7 +729,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         updateToggleButtonIcon()
     }
 
-    // ——— Te metody mogą być też wołane z innych miejsc ———
+    // ——— These methods can also be called from other places ———
 
     @objc private func selectAllTargets() {
         stateQ.sync {
@@ -872,7 +873,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     @objc private func quit() { NSApp.terminate(nil) }
 
-    // MARK: - Tick / ping równoległy
+    // MARK: - Tick / parallel ping
     private func tick() {
         if !isRunning { return }
 
@@ -893,7 +894,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     private func pingOne(host: String) {
-        // atomowy znacznik inFlight
+        // atomic inFlight marker
         let shouldStart: Bool = stateQ.sync {
             var st = self.hostStates[host] ?? HostState()
             if st.inFlight { return false }
@@ -943,7 +944,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    // ICMP przez /sbin/ping (Sandbox OFF)
+    // ICMP via /sbin/ping (Sandbox OFF)
     private func runPingOnceICMP(host: String) -> Bool {
         let task = Process()
         task.launchPath = Config.pingPath
@@ -983,7 +984,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    /// Ustala kolor kropki na trayu na podstawie łącznego stanu
+    /// Sets tray dot color based on aggregate state
     private func updateAggregateTrayIcon() {
         if !isRunning {
             setTrayIcon(color: .systemGray, tooltip: "Paused")
@@ -1012,7 +1013,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         } else if !anyUnknown {
             setTrayIcon(color: .systemGreen, tooltip: "All hosts up")
         }
-        // w trakcie stabilizacji utrzymujemy poprzedni kolor
+        // durring stabilization we keep the previous color
     }
 
     private func updateToggleButtonIcon() {
@@ -1022,8 +1023,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let currentMonitored = self.stateQ.sync { self.monitoredHosts }
             let allSelected = currentMonitored.count == self.hosts.count && !self.hosts.isEmpty
             
-            // Jeśli wszystkie są zaznaczone - pokaż ikonę do odznaczenia
-            // Jeśli nie wszystkie - pokaż ikonę do zaznaczenia
+            // If all are selected - show icon for deselecting
+            // If not all selected - show icon for selecting
             let iconName = allSelected ? "checkmark.circle.fill" : "checkmark.circle"
             button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: "Toggle All")
             
@@ -1065,7 +1066,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private func loadPrefs() {
         let ud = UserDefaults.standard
 
-        // Pierwsze uruchomienie -> defaults; jeśli klucz istnieje (nawet pusta lista) -> użyj go
+        // First run -> defaults; if key exists (even empty list) -> use it
         if ud.object(forKey: PrefKey.hosts) != nil {
             hosts = (ud.array(forKey: PrefKey.hosts) as? [String]) ?? []
         } else {
@@ -1103,9 +1104,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private func savePrefs() {
         let ud = UserDefaults.standard
-        ud.set(hosts, forKey: PrefKey.hosts)                      // może być pusta
+        ud.set(hosts, forKey: PrefKey.hosts)                      // can be empty
         let mon = stateQ.sync { Array(self.monitoredHosts) }
-        ud.set(mon, forKey: PrefKey.monitored)                    // może być pusta
+        ud.set(mon, forKey: PrefKey.monitored)                    // can be empty
         if let a = activeHost { ud.set(a, forKey: PrefKey.activeHost) }
     }
 
@@ -1178,13 +1179,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    // MARK: - Notyfikacje w foreground
+    // MARK: - Mods in foreground
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .sound]
     }
 
-    // MARK: - Małe helpery
+    // MARK: - Small helpers
     private func showInfoAlert(title: String, text: String) {
         let a = NSAlert()
         a.messageText = title
