@@ -89,8 +89,4 @@ class HTTPMonitor {
         
         return (result, httpStatus)
     }
-    
-    private func extractHostFromUrl(_ url: URL) -> String? {
-        return url.host
-    }
 }

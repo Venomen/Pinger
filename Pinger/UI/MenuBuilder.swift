@@ -69,72 +69,67 @@ class MenuBuilder: NSObject, NSMenuDelegate {
         currentMenu = menu  // Store reference
         
         // Status
-        let status = NSMenuItem(title: "Status: Paused", action: nil, keyEquivalent: "")
-        status.isEnabled = false
+        let status = createDisabledMenuItem(title: "Status: Paused")
         menu.addItem(status)
         statusMenuItem = status
-        menu.addItem(.separator())
+        menu.addItem(createSeparator())
         
         // Start/Stop
         let startStop = makeInlineButton(title: "Start", action: #selector(startStopAction))
         menu.addItem(startStop)
         startStopMenuItem = startStop
         
-        menu.addItem(.separator())
+        menu.addItem(createSeparator())
         
         // Targets header
         let header = makeTargetsHeader()
         menu.addItem(header)
-        menu.addItem(.separator())
+        menu.addItem(createSeparator())
         
         // Host list will be added here dynamically
         refreshTargetsSection(in: menu)
         
         // Add host row
         menu.addItem(makeInlineAddHostRow())
-        menu.addItem(.separator())
+        menu.addItem(createSeparator())
         
         // Settings
         menu.addItem(buildSettingsMenu())
         
         // About & Quit
-        let aboutItem = NSMenuItem(title: "About Pinger", action: #selector(showAboutAction), keyEquivalent: "")
-        aboutItem.target = self
-        menu.addItem(.separator())
+        let aboutItem = createMenuItem(title: "About Pinger", action: #selector(showAboutAction))
+        menu.addItem(createSeparator())
         menu.addItem(aboutItem)
         
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quitAction), keyEquivalent: "q")
-        quitItem.target = self
+        let quitItem = createMenuItem(title: "Quit", action: #selector(quitAction), keyEquivalent: "q")
         menu.addItem(quitItem)
         
         return menu
     }
     
-    func updateMenu(hosts: [String], monitored: Set<String>, states: [String: HostState], isRunning: Bool) {
+    func updateMenu(hosts: [String], monitored: Set<String>, states: [String: HostState], isRunning: Bool, fullRebuild: Bool = true) {
         self.hosts = hosts
         self.monitoredHosts = monitored
         self.hostStates = states
         self.isRunning = isRunning
         
-        updateStartStopTitle()
-        refreshTargetsSection(in: currentMenu)
-        updateToggleButtonIcon()
-        updateSettingsStates()  // Add settings update
-        updateErrorState()
+        if fullRebuild {
+            updateStartStopTitle()
+            refreshTargetsSection(in: currentMenu)
+            updateToggleButtonIcon()
+            updateSettingsStates()
+            updateErrorState()
+        } else {
+            // Lightweight update for frequent operations
+            AppLogger.L("updateMenu (lightweight): hosts=\(hosts.count), monitored=\(monitored.count)")
+            updateStartStopTitle()
+            updateToggleButtonIcon()
+        }
     }
     
+    // Convenience method for lightweight updates
     func updateInternalState(hosts: [String], monitored: Set<String>, states: [String: HostState], isRunning: Bool) {
-        // Update internal state without rebuilding menu structure
-        self.hosts = hosts
-        self.monitoredHosts = monitored
-        self.hostStates = states
-        self.isRunning = isRunning
-        
-        AppLogger.L("updateInternalState: hosts=\(hosts.count), monitored=\(monitored.count)")
-        
-        // Only update essential UI elements that don't cause menu reconstruction
-        updateStartStopTitle()
-        updateToggleButtonIcon()
+        updateMenu(hosts: hosts, monitored: monitored, states: states, isRunning: isRunning, fullRebuild: false)
     }
     
     func updateStatusText(_ text: String) {
@@ -725,5 +720,23 @@ class MenuBuilder: NSObject, NSMenuDelegate {
     
     @objc private func quitAction() {
         delegate?.menuBuilder(self, didSelectAction: .quit)
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func createMenuItem(title: String, action: Selector? = nil, keyEquivalent: String = "", target: AnyObject? = nil) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = target ?? self
+        return item
+    }
+    
+    private func createSeparator() -> NSMenuItem {
+        return NSMenuItem.separator()
+    }
+    
+    private func createDisabledMenuItem(title: String) -> NSMenuItem {
+        let item = createMenuItem(title: title)
+        item.isEnabled = false
+        return item
     }
 }
